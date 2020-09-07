@@ -1,0 +1,621 @@
+type: edu
+custom_name: stage3
+files:
+- name: src/advisor/Main.java
+  visible: true
+  text: |
+    package advisor;
+
+    public class Main {
+        public static void main(String[] args) {
+            System.out.println("Hello World!");
+        }
+    }
+  learner_created: false
+- name: build.gradle
+  visible: true
+  text: |-
+    apply plugin: 'java'
+    apply plugin: 'application'
+
+    group 'advisor'
+    version '1.0-SNAPSHOT'
+
+    sourceCompatibility = 11
+    mainClassName = 'advisor.Main'
+
+    repositories {
+        mavenCentral()
+    }
+
+    dependencies {
+        compile 'com.google.code.gson:gson:+'
+    }
+
+    jar {
+        manifest {
+            attributes 'Main-Class' : 'advisor.Main'
+        }
+        from {
+            configurations.compile.collect { it.isDirectory() ? it : zipTree(it) }
+        }
+    }
+  learner_created: false
+- name: test/MockTokenServer.java
+  visible: false
+  text: |
+    import org.hyperskill.hstest.mocks.web.WebServerMock;
+
+    public class MockTokenServer extends Thread {
+
+        WebServerMock accessServer;
+
+        public MockTokenServer (WebServerMock accessServer) {
+            this.accessServer = accessServer;
+        }
+
+        @Override
+        public void run() {
+            accessServer.start();
+            accessServer.run();
+        }
+
+        public void stopMock() {
+            interrupt();
+        }
+    }
+  learner_created: false
+- name: test/MusicAdvisorTest.java
+  visible: false
+  text: |-
+    import advisor.Main;
+    import org.hyperskill.hstest.dynamic.input.DynamicTestingMethod;
+    import org.hyperskill.hstest.mocks.web.WebServerMock;
+    import org.hyperskill.hstest.stage.StageTest;
+    import org.hyperskill.hstest.testcase.CheckResult;
+    import org.hyperskill.hstest.testing.TestedProgram;
+    import org.junit.AfterClass;
+
+    public class MusicAdvisorTest extends StageTest<String> {
+
+        private static final String fictiveAuthCode = "123123";
+        private static final String fictiveAccessToken = "456456";
+        private static final String fictiveRefreshToken = "567567";
+
+        private static final int accessServerPort = 45678;
+        private static final String accessServerUrl = "http://127.0.0.1:" + accessServerPort;
+
+        private static final String[] arguments = new String[]{
+                "-access",
+                accessServerUrl
+        };
+
+        private static final String tokenResponse = "{" +
+                "\"access_token\":\"" + fictiveAccessToken + "\"," +
+                "\"token_type\":\"Bearer\"," +
+                "\"expires_in\":3600," +
+                "\"refresh_token\":" + "\"" + fictiveRefreshToken + "\"," +
+                "\"scope\":\"\"" +
+                "}";
+
+        private static final WebServerMock accessServer = new WebServerMock(accessServerPort)
+                .setPage("/api/token", tokenResponse);
+
+        private static final MockTokenServer tokenServer = new MockTokenServer(accessServer);
+
+        @DynamicTestingMethod
+        CheckResult testAuth() {
+
+            TestedProgram userProgram = new TestedProgram(Main.class);
+            userProgram.start(arguments);
+            userProgram.setReturnOutputAfterExecution(false);
+
+            Server server = new Server(userProgram, fictiveAuthCode);
+            server.start();
+            tokenServer.start();
+
+            userProgram.goBackground();
+            userProgram.execute("auth");
+
+            try {
+                server.join();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+
+            if (Server.checkResult != null) {
+                return Server.checkResult;
+            }
+
+            userProgram.stopBackground();
+
+            String outputAfterAuth = userProgram.getOutput();
+            if (!outputAfterAuth.contains(fictiveAccessToken)) {
+                return CheckResult.wrong("Not found correct access token in the result. " +
+                        "Make sure, that you use the server from the command line arguments to access the token.");
+            }
+
+            userProgram.execute("featured");
+
+            String outputAfterFeatured = userProgram.getOutput();
+            if (!outputAfterFeatured.contains("---FEATURED---")) {
+                return CheckResult.wrong("When \"featured\" was inputted there should be \"---FEATURED---\" line");
+            }
+
+            userProgram.execute("exit");
+            userProgram.stop();
+
+            return CheckResult.correct();
+        }
+
+        @DynamicTestingMethod
+        CheckResult testNewWithoutAuth() {
+
+            TestedProgram userProgram = new TestedProgram(Main.class);
+            userProgram.start(arguments);
+            userProgram.setReturnOutputAfterExecution(false);
+
+            userProgram.execute("new");
+            String outputAfterNew = userProgram.getOutput();
+
+            if (!outputAfterNew.strip().startsWith("Please, provide access for application.")) {
+                return CheckResult.wrong("When no access provided you should output " +
+                        "\"Please, provide access for application.\"");
+            }
+
+            userProgram.execute("exit");
+            userProgram.stop();
+
+            return CheckResult.correct();
+        }
+
+        @DynamicTestingMethod
+        CheckResult testFeaturedWithoutAuth() {
+
+            TestedProgram userProgram = new TestedProgram(Main.class);
+            userProgram.start(arguments);
+            userProgram.setReturnOutputAfterExecution(false);
+
+            userProgram.execute("featured");
+            String outputAfterNew = userProgram.getOutput();
+
+            if (!outputAfterNew.strip().startsWith("Please, provide access for application.")) {
+                return CheckResult.wrong("When no access provided you should output " +
+                        "\"Please, provide access for application.\"");
+            }
+
+            userProgram.execute("exit");
+            userProgram.stop();
+
+            return CheckResult.correct();
+        }
+
+        @AfterClass
+        public static void afterTest() {
+            tokenServer.stopMock();
+        }
+
+    }
+  learner_created: false
+- name: test/Server.java
+  visible: false
+  text: |
+    import org.hyperskill.hstest.dynamic.output.SystemOutHandler;
+    import org.hyperskill.hstest.testcase.CheckResult;
+    import org.hyperskill.hstest.testing.TestedProgram;
+
+    import java.net.URI;
+    import java.net.http.HttpClient;
+    import java.net.http.HttpRequest;
+    import java.net.http.HttpResponse;
+    import java.net.http.HttpTimeoutException;
+    import java.time.Duration;
+
+    public class Server extends Thread {
+
+        TestedProgram userProgram;
+        private final String fictiveAuthCode;
+        public static CheckResult checkResult = null;
+        String redirectUri = "";
+
+
+        public Server(TestedProgram userProgram, String fictiveAuthCode) {
+            this.userProgram = userProgram;
+            this.fictiveAuthCode = fictiveAuthCode;
+        }
+
+        @Override
+        public void run() {
+            long searchTime = System.currentTimeMillis();
+
+            while (!Thread.interrupted()) {
+
+                if (System.currentTimeMillis() - searchTime > 1000 * 9) {
+                    checkResult = CheckResult.wrong("Not found a link with redirect_uri after 9 seconds.");
+                    return;
+                }
+
+                String out = SystemOutHandler.getDynamicOutput();
+                if (out.contains("redirect_uri=")) {
+                    redirectUri = out.split("redirect_uri=")[1];
+                    if (redirectUri.contains("&")) {
+                        redirectUri = redirectUri.split("&")[0];
+                    }
+                    if (redirectUri.contains("\n")) {
+                        redirectUri = redirectUri.split("\\R")[0];
+                    }
+                    break;
+                }
+
+                try {
+                    sleep(300);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            }
+
+            try {
+                HttpClient client = HttpClient.newBuilder().build();
+                HttpRequest emptyRequest = HttpRequest.newBuilder()
+                        .uri(URI.create(redirectUri))
+                        .timeout(Duration.ofMillis(500))
+                        .GET()
+                        .build();
+                HttpRequest errorRequest = HttpRequest.newBuilder()
+                        .uri(URI.create(redirectUri + "?error=access_denied"))
+                        .timeout(Duration.ofMillis(500))
+                        .GET()
+                        .build();
+                HttpRequest codeRequest = HttpRequest.newBuilder()
+                        .uri(URI.create(redirectUri + "?code=" + fictiveAuthCode))
+                        .timeout(Duration.ofMillis(500))
+                        .GET()
+                        .build();
+
+                System.out.println("Tester: making requests to redirect uri: " + redirectUri);
+                HttpResponse<String> badResponse = client.send(emptyRequest, HttpResponse.BodyHandlers.ofString());
+                System.out.println("Tester: done request 1: " + badResponse.body());
+                HttpResponse<String> badResponse2 = client.send(errorRequest, HttpResponse.BodyHandlers.ofString());
+                System.out.println("Tester: done request 2: " + badResponse2.body());
+                HttpResponse<String> goodResponse = client.send(codeRequest, HttpResponse.BodyHandlers.ofString());
+                System.out.println("Tester: done request 3: " + goodResponse.body());
+
+                if (!badResponse.body().contains("Not found authorization code. Try again.")
+                        || !badResponse2.body().contains("Not found authorization code. Try again.")) {
+                    checkResult = CheckResult.wrong("You should send to the browser: `Not found authorization code. Try again.` if there is no code.");
+                    return;
+                }
+
+                if (!goodResponse.body().contains("Got the code. Return back to your program.")) {
+                    checkResult = CheckResult.wrong("\"You should send `Got the code. Return back to your program.` \" +\n" +
+                            "                        \"if the query contains the code.");
+                }
+            } catch (HttpTimeoutException e) {
+                checkResult = CheckResult.wrong("Not received any response from the server, found in redirect_uri: "
+                        + redirectUri);
+            } catch (InterruptedException e) {
+                checkResult = CheckResult.wrong("Request to " + redirectUri + " was interrupted. " +
+                        "Make sure, that you give the right feedback in your browser.");
+            } catch (Exception e) {
+                System.out.println("Tester: Error: " + e.getMessage());
+                e.printStackTrace();
+            }
+
+        }
+    }
+  learner_created: false
+- name: src/advisor/command/FeaturedCommand.java
+  visible: true
+  text: |
+    package advisor.command;
+
+    import advisor.command.Command;
+
+    public class FeaturedCommand implements Command {
+        @Override
+        public String name() {
+            return "featured";
+        }
+
+        @Override
+        public void execute(String... args) {
+            System.out.print("---FEATURED---\n" +
+                    "Mellow Morning\n" +
+                    "Wake Up and Smell the Coffee\n" +
+                    "Monday Motivation\n" +
+                    "Songs to Sing in the Shower\n");
+        }
+    }
+  learner_created: true
+- name: src/advisor/command/ExitCommand.java
+  visible: true
+  text: |
+    package advisor.command;
+
+    import advisor.command.Command;
+
+    public class ExitCommand implements Command {
+        @Override
+        public String name() {
+            return "exit";
+        }
+
+        @Override
+        public void execute(String... args) {
+            System.out.println("---GOODBYE!---");
+        }
+    }
+  learner_created: true
+- name: src/advisor/command/AuthCommand.java
+  visible: true
+  text: |
+    package advisor.command;
+
+    import advisor.command.Command;
+
+    public class AuthCommand implements Command {
+        @Override
+        public String name() {
+            return "auth";
+        }
+
+        @Override
+        public void execute(String... args) {
+            System.out.println("https://accounts.spotify.com/authorize?client_id=58c556a7e590450497f6bc4982153c49&redirect_uri=http://mymusicadvisor.com&response_type=code\n" +
+                    "---SUCCESS---");
+        }
+    }
+  learner_created: true
+- name: src/advisor/menu/LoginMenu.java
+  visible: true
+  text: |
+    package advisor.menu;
+
+    import advisor.Utils;
+    import advisor.command.*;
+
+    import java.util.Arrays;
+    import java.util.List;
+
+    import static advisor.Utils.input;
+
+    public class LoginMenu implements CommandMenu {
+        private static class AuthenticationCommand implements Command {
+            private final Command command;
+
+            public AuthenticationCommand(Command command) {
+                this.command = command;
+            }
+
+            @Override
+            public String name() {
+                return command.name();
+            }
+
+            @Override
+            public void execute(String... args) {
+                System.out.println("Please, provide access for application.");
+            }
+        }
+
+        final List<Command> commandList = List.of(
+                new ExitCommand(),
+                new CommandDecorator(new AuthenticationCommand(new NewListCommand()), this),
+                new CommandDecorator(new AuthenticationCommand(new CategoriesCommand()), this),
+                new CommandDecorator(new AuthenticationCommand(new FeaturedCommand()), this),
+                new CommandDecorator(new AuthenticationCommand(new PlaylistCommand()), this),
+                new CommandDecorator(new AuthCommand(), new UserMenu()),
+                new CommandDecorator(new UnknownCommand(), this));
+
+        public void enter() {
+            final String[] inputCommand = input();
+            Command command = Utils.setCommand(inputCommand[0], commandList);
+            command.execute(Arrays.copyOfRange(inputCommand, 1, inputCommand.length));
+        }
+    }
+  learner_created: true
+- name: src/advisor/command/Command.java
+  visible: true
+  text: |
+    package advisor.command;
+
+    public interface Command {
+        String name();
+
+        void execute(String... args);
+    }
+  learner_created: true
+- name: src/advisor/command/CategoriesCommand.java
+  visible: true
+  text: |
+    package advisor.command;
+
+    import advisor.command.Command;
+
+    public class CategoriesCommand implements Command {
+        @Override
+        public String name() {
+            return "categories";
+        }
+
+        @Override
+        public void execute(String... args) {
+            System.out.println("---CATEGORIES---\n" +
+                    "Top Lists\n" +
+                    "Pop\n" +
+                    "Mood\n" +
+                    "Latin");
+        }
+    }
+  learner_created: true
+- name: src/advisor/command/PlaylistCommand.java
+  visible: true
+  text: |
+    package advisor.command;
+
+    import advisor.command.Command;
+
+    public class PlaylistCommand implements Command {
+        @Override
+        public String name() {
+            return "playlists";
+        }
+
+        @Override
+        public void execute(String... args) {
+            System.out.println(
+                    args.length > 0 ?
+                            "---" + args[0].toUpperCase() + " PLAYLISTS---\n" +
+                                    "Walk Like A Badass  \n" +
+                                    "Rage Beats  \n" +
+                                    "Arab Mood Booster  \n" +
+                                    "Sunday Stroll" :
+                            "You must enter a playlist name"
+            );
+        }
+    }
+  learner_created: true
+- name: src/advisor/menu/CommandDecorator.java
+  visible: true
+  text: |
+    package advisor.menu;
+
+    import advisor.command.Command;
+    import advisor.menu.CommandMenu;
+
+    public class CommandDecorator implements Command {
+        protected Command decorateCommand;
+        protected CommandMenu decorateMenu;
+
+        public CommandDecorator(Command decorateCommand, CommandMenu decorateMenu) {
+            this.decorateCommand = decorateCommand;
+            this.decorateMenu = decorateMenu;
+        }
+
+        @Override
+        public String name() {
+            return decorateCommand.name();
+        }
+
+        @Override
+        public void execute(String... args) {
+            decorateCommand.execute(args);
+            decorateMenu.enter();
+        }
+    }
+  learner_created: true
+- name: src/advisor/command/NewListCommand.java
+  visible: true
+  text: |
+    package advisor.command;
+
+    import advisor.command.Command;
+
+    public class NewListCommand implements Command {
+        @Override
+        public String name() {
+            return "new";
+        }
+
+        @Override
+        public void execute(String... args) {
+            System.out.println("---NEW RELEASES---\n" +
+                    "Mountains [Sia, Diplo, Labrinth]\n" +
+                    "Runaway [Lil Peep]\n" +
+                    "The Greatest Show [Panic! At The Disco]\n" +
+                    "All Out Life [Slipknot]");
+        }
+    }
+  learner_created: true
+- name: src/advisor/menu/UserMenu.java
+  visible: true
+  text: |
+    package advisor.menu;
+
+    import advisor.Utils;
+    import advisor.Utils.*;
+    import advisor.command.*;
+
+    import java.util.Arrays;
+    import java.util.List;
+
+    import static advisor.Utils.input;
+
+    public class UserMenu implements CommandMenu {
+        private final Command newCommand = new NewListCommand();
+        private final Command categoriesCommand = new CategoriesCommand();
+        private final Command featuredCommand = new FeaturedCommand();
+        private final Command playlistCommand = new PlaylistCommand();
+
+        final List<Command> commandList = List.of(
+                new ExitCommand(),
+                new CommandDecorator(newCommand, this),
+                new CommandDecorator(categoriesCommand, this),
+                new CommandDecorator(featuredCommand, this),
+                new CommandDecorator(playlistCommand, this),
+                new CommandDecorator(new UnknownCommand(), this));
+
+        public void enter() {
+            System.out.println("> ");
+            final String[] inputCommand = input();
+            Command command = Utils.setCommand(inputCommand[0], commandList);
+            command.execute(Arrays.copyOfRange(inputCommand, 1, inputCommand.length));
+        }
+    }
+  learner_created: true
+- name: src/advisor/command/UnknownCommand.java
+  visible: true
+  text: |
+    package advisor.command;
+
+    import advisor.command.Command;
+
+    public class UnknownCommand implements Command {
+        @Override
+        public String name() {
+            return "Unknown command";
+        }
+
+        @Override
+        public void execute(String... args) {
+            System.out.println("Error: unknown command entered.");
+        }
+    }
+  learner_created: true
+- name: src/advisor/menu/CommandMenu.java
+  visible: true
+  text: |
+    package advisor.menu;
+
+    public interface CommandMenu {
+        void enter();
+    }
+  learner_created: true
+- name: src/advisor/Strategy.java
+  visible: true
+  learner_created: true
+- name: src/advisor/Categories.java
+  visible: true
+  learner_created: true
+- name: src/advisor/Featured.java
+  visible: true
+  learner_created: true
+- name: src/advisor/Playlist.java
+  visible: true
+  learner_created: true
+- name: src/advisor/NewReleases.java
+  visible: true
+  learner_created: true
+- name: src/advisor/Context.java
+  visible: true
+  learner_created: true
+- name: src/advisor/Authorize.java
+  visible: true
+  learner_created: true
+feedback_link: https://hyperskill.org/projects/62/stages/337/implement
+status: Solved
+feedback:
+  message: Congratulations! Continue on <a href="https://hyperskill.org/projects/62/stages/337/implement">JetBrains
+    Academy</a>
+  time: Tue, 25 Aug 2020 15:02:42 UTC
+record: 3
